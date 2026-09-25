@@ -123,6 +123,11 @@ name = "user_modules"
 path = "examples/user_modules/main.rs"
 test = false
 
+[[example]]
+name = "slide_benchmark"
+path = "examples/slide_benchmark.rs"
+test = false
+
 [[bench]]
 name = "benchmarks"
 harness = false

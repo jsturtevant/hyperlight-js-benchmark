@@ -1,0 +1,350 @@
+use std::fs;
+use std::process::Command;
+use std::thread;
+use std::time::{Duration, Instant};
+
+use anyhow::{Context, Result};
+use hyperlight_host::sandbox::snapshot::{OciTag, Snapshot};
+use hyperlight_js::{LoadedJSSandbox, SandboxBuilder, Script};
+
+const HANDLER: &str = r#"
+function handler(event) {
+    event.answer = event.value + 1;
+    return event;
+}
+"#;
+const EVENT: &str = r#"{"value":41}"#;
+
+#[repr(C)]
+struct Timespec {
+    tv_sec: i64,
+    tv_nsec: i64,
+}
+
+unsafe extern "C" {
+    fn clock_gettime(clock_id: i32, time: *mut Timespec) -> i32;
+}
+
+fn process_cpu_ns() -> Result<u128> {
+    const CLOCK_PROCESS_CPUTIME_ID: i32 = 2;
+    let mut time = Timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `time` is a valid writable timespec and the clock id is defined by Linux.
+    let result = unsafe { clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &mut time) };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(time.tv_sec as u128 * 1_000_000_000 + time.tv_nsec as u128)
+}
+
+fn status_kib(field: &str) -> Result<u64> {
+    let status = fs::read_to_string("/proc/self/status")?;
+    let prefix = format!("{field}:");
+    let line = status
+        .lines()
+        .find(|line| line.starts_with(&prefix))
+        .with_context(|| format!("{field} missing from /proc/self/status"))?;
+    line.split_whitespace()
+        .nth(1)
+        .with_context(|| format!("{field} value missing"))?
+        .parse()
+        .with_context(|| format!("{field} was not numeric"))
+}
+
+fn rss_kib() -> Result<u64> {
+    status_kib("VmRSS")
+}
+
+fn pss_kib() -> Result<u64> {
+    let rollup = fs::read_to_string("/proc/self/smaps_rollup")?;
+    let line = rollup
+        .lines()
+        .find(|line| line.starts_with("Pss:"))
+        .context("Pss missing from /proc/self/smaps_rollup")?;
+    line.split_whitespace()
+        .nth(1)
+        .context("Pss value missing")?
+        .parse()
+        .context("Pss was not numeric")
+}
+
+fn loaded_sandbox() -> Result<LoadedJSSandbox> {
+    let mut sandbox = SandboxBuilder::new().build()?.load_runtime()?;
+    sandbox.add_handler("handler", Script::from_content(HANDLER))?;
+    Ok(sandbox.get_loaded_sandbox()?)
+}
+
+fn percentile_ns(samples: &mut [u128], percentile: f64) -> u128 {
+    samples.sort_unstable();
+    let index = ((samples.len() - 1) as f64 * percentile).round() as usize;
+    samples[index]
+}
+
+fn print_latency(name: &str, mut samples: Vec<u128>) {
+    let count = samples.len() as u128;
+    let mean = samples.iter().sum::<u128>() / count;
+    let p50 = percentile_ns(&mut samples, 0.50);
+    let p95 = percentile_ns(&mut samples, 0.95);
+    let p99 = percentile_ns(&mut samples, 0.99);
+    println!(
+        "{name}: mean={:.3} ms p50={:.3} ms p95={:.3} ms p99={:.3} ms",
+        mean as f64 / 1_000_000.0,
+        p50 as f64 / 1_000_000.0,
+        p95 as f64 / 1_000_000.0,
+        p99 as f64 / 1_000_000.0
+    );
+}
+
+fn measure_single_file_snapshot(path: &str) -> Result<()> {
+    let rss_before = rss_kib()?;
+    let pss_before = pss_kib()?;
+    let vmsize_before = status_kib("VmSize")?;
+    let anon_before = status_kib("RssAnon")?;
+    let file_before = status_kib("RssFile")?;
+    let total_start = Instant::now();
+    let cpu_start = process_cpu_ns()?;
+    let load_start = Instant::now();
+    let tag = OciTag::new("initialized")?;
+    let snapshot = std::sync::Arc::new(Snapshot::load(path, tag)?);
+    let load_elapsed = load_start.elapsed();
+    let build_start = Instant::now();
+    let mut sandbox = LoadedJSSandbox::from_snapshot(snapshot)?;
+    let build_elapsed = build_start.elapsed();
+    let handler_start = Instant::now();
+    let result = sandbox.handle_event("handler", EVENT.to_string(), Some(false))?;
+    let handler_elapsed = handler_start.elapsed();
+    let total_elapsed = total_start.elapsed();
+    let cpu_elapsed = process_cpu_ns()? - cpu_start;
+    thread::sleep(Duration::from_millis(100));
+    let rss_after = rss_kib()?;
+    let pss_after = pss_kib()?;
+    let vmsize_after = status_kib("VmSize")?;
+    let anon_after = status_kib("RssAnon")?;
+    let file_after = status_kib("RssFile")?;
+    let delta_kib = rss_after.saturating_sub(rss_before);
+
+    println!("single file snapshot RSS before load: {rss_before} KiB");
+    println!("single file snapshot RSS after handler: {rss_after} KiB");
+    println!(
+        "single file snapshot incremental RSS: {:.2} MiB",
+        delta_kib as f64 / 1024.0
+    );
+    println!(
+        "single file snapshot incremental PSS: {:.2} MiB",
+        pss_after.saturating_sub(pss_before) as f64 / 1024.0
+    );
+    println!(
+        "single file snapshot virtual mapping delta: {:.2} MiB",
+        vmsize_after.saturating_sub(vmsize_before) as f64 / 1024.0
+    );
+    println!(
+        "single file snapshot anonymous RSS delta: {:.2} MiB",
+        anon_after.saturating_sub(anon_before) as f64 / 1024.0
+    );
+    println!(
+        "single file snapshot file RSS delta: {:.2} MiB",
+        file_after.saturating_sub(file_before) as f64 / 1024.0
+    );
+    println!(
+        "file snapshot parse + mmap: {:.3} ms",
+        load_elapsed.as_secs_f64() * 1_000.0
+    );
+    println!(
+        "VM + vCPU reconstruction: {:.3} ms",
+        build_elapsed.as_secs_f64() * 1_000.0
+    );
+    println!(
+        "first handler execution: {:.3} ms",
+        handler_elapsed.as_secs_f64() * 1_000.0
+    );
+    println!(
+        "unchecked file snapshot load to handler result: {:.3} ms ({result})",
+        total_elapsed.as_secs_f64() * 1_000.0
+    );
+    println!(
+        "file snapshot load to handler CPU time: {:.3} ms",
+        cpu_elapsed as f64 / 1_000_000.0
+    );
+    Ok(())
+}
+
+fn measure_cold_initialization() -> Result<()> {
+    let rss_before = rss_kib()?;
+    let wall_start = Instant::now();
+    let cpu_start = process_cpu_ns()?;
+    let mut sandbox = loaded_sandbox()?;
+    let result = sandbox.handle_event("handler", EVENT.to_string(), Some(false))?;
+    let wall_elapsed = wall_start.elapsed();
+    let cpu_elapsed = process_cpu_ns()? - cpu_start;
+    thread::sleep(Duration::from_millis(100));
+    let rss_after = rss_kib()?;
+    let delta_kib = rss_after.saturating_sub(rss_before);
+
+    println!("cold initialization RSS before: {rss_before} KiB");
+    println!("cold initialization RSS after handler: {rss_after} KiB");
+    println!(
+        "cold initialization incremental RSS: {:.2} MiB",
+        delta_kib as f64 / 1024.0
+    );
+    println!(
+        "cold initialization to handler result wall time: {:.3} ms ({result})",
+        wall_elapsed.as_secs_f64() * 1_000.0
+    );
+    println!(
+        "cold initialization to handler result CPU time: {:.3} ms",
+        cpu_elapsed as f64 / 1_000_000.0
+    );
+    Ok(())
+}
+
+fn measure_sequential_rss() -> Result<()> {
+    let baseline = rss_kib()?;
+    let mut previous = baseline;
+    let mut sandboxes = Vec::with_capacity(4);
+    println!("sequential RSS baseline: {baseline} KiB");
+
+    for index in 1..=4 {
+        let mut sandbox = loaded_sandbox()?;
+        sandbox.handle_event("handler", EVENT.to_string(), Some(false))?;
+        sandboxes.push(sandbox);
+        thread::sleep(Duration::from_millis(100));
+        let current = rss_kib()?;
+        let incremental = current.saturating_sub(previous);
+        println!(
+            "sandbox {index}: total_delta={:.2} MiB incremental={:.2} MiB",
+            current.saturating_sub(baseline) as f64 / 1024.0,
+            incremental as f64 / 1024.0
+        );
+        previous = current;
+    }
+
+    Ok(())
+}
+
+fn main() -> Result<()> {
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("--measure-cold") {
+        return measure_cold_initialization();
+    }
+    if args.get(1).map(String::as_str) == Some("--measure-sequential-rss") {
+        return measure_sequential_rss();
+    }
+    if args.get(1).map(String::as_str) == Some("--measure-file-rss") {
+        return measure_single_file_snapshot(
+            args.get(2).context("snapshot path argument missing")?,
+        );
+    }
+
+    for (title, argument) in [
+        ("COLD INITIALIZATION", "--measure-cold"),
+        ("SEQUENTIAL VM MEMORY", "--measure-sequential-rss"),
+    ] {
+        println!("\n=== {title} ===");
+        let status = Command::new(std::env::current_exe()?)
+            .arg(argument)
+            .status()?;
+        if !status.success() {
+            anyhow::bail!("benchmark child {argument} failed: {status}");
+        }
+    }
+
+    println!("\n=== SNAPSHOT BENCHMARKS ===");
+    let mut sandbox = loaded_sandbox()?;
+    sandbox.handle_event("handler", EVENT.to_string(), Some(false))?;
+    let snapshot = sandbox.snapshot()?;
+    let snapshot_dir = tempfile::tempdir()?;
+    let snapshot_layout = snapshot_dir.path().join("quickjs");
+    let save_start = Instant::now();
+    let digest = sandbox.save_file_snapshot(&snapshot_layout, "initialized")?;
+    let save_elapsed = save_start.elapsed();
+
+    for _ in 0..500 {
+        sandbox.handle_event("handler", EVENT.to_string(), Some(false))?;
+        sandbox.restore(snapshot.clone())?;
+    }
+
+    let mut execution = Vec::with_capacity(5_000);
+    let execution_cpu_start = process_cpu_ns()?;
+    for _ in 0..5_000 {
+        let start = Instant::now();
+        sandbox.handle_event("handler", EVENT.to_string(), Some(false))?;
+        execution.push(start.elapsed().as_nanos());
+    }
+    let execution_cpu = process_cpu_ns()? - execution_cpu_start;
+
+    let mut restore = Vec::with_capacity(5_000);
+    let restore_cpu_start = process_cpu_ns()?;
+    for _ in 0..5_000 {
+        let start = Instant::now();
+        sandbox.restore(snapshot.clone())?;
+        restore.push(start.elapsed().as_nanos());
+    }
+    let restore_cpu = process_cpu_ns()? - restore_cpu_start;
+
+    let mut snapshot_to_result = Vec::with_capacity(5_000);
+    let snapshot_to_result_cpu_start = process_cpu_ns()?;
+    for _ in 0..5_000 {
+        let start = Instant::now();
+        sandbox.restore(snapshot.clone())?;
+        sandbox.handle_event("handler", EVENT.to_string(), Some(false))?;
+        snapshot_to_result.push(start.elapsed().as_nanos());
+    }
+    let snapshot_to_result_cpu = process_cpu_ns()? - snapshot_to_result_cpu_start;
+
+    drop(sandbox);
+    let child_status = Command::new(std::env::current_exe()?)
+        .arg("--measure-file-rss")
+        .arg(&snapshot_layout)
+        .status()?;
+    if !child_status.success() {
+        anyhow::bail!("single file snapshot RSS child failed: {child_status}");
+    }
+
+    thread::sleep(Duration::from_millis(100));
+    let memory_baseline = rss_kib()?;
+    let sandbox_count = 12_u64;
+    let mut sandboxes = Vec::with_capacity(sandbox_count as usize);
+    for _ in 0..sandbox_count {
+        let mut item = loaded_sandbox()?;
+        item.handle_event("handler", EVENT.to_string(), Some(false))?;
+        sandboxes.push(item);
+    }
+    thread::sleep(Duration::from_millis(250));
+    let memory_loaded = rss_kib()?;
+    let delta_kib = memory_loaded.saturating_sub(memory_baseline);
+
+    print_latency("warm JS execution", execution);
+    println!(
+        "warm JS execution mean CPU: {:.3} ms",
+        execution_cpu as f64 / 5_000.0 / 1_000_000.0
+    );
+    print_latency("snapshot restore", restore);
+    println!(
+        "snapshot restore mean CPU: {:.3} ms",
+        restore_cpu as f64 / 5_000.0 / 1_000_000.0
+    );
+    print_latency(
+        "initialized QuickJS snapshot to handler result",
+        snapshot_to_result,
+    );
+    println!(
+        "initialized QuickJS snapshot to result mean CPU: {:.3} ms",
+        snapshot_to_result_cpu as f64 / 5_000.0 / 1_000_000.0
+    );
+    println!(
+        "save initialized QuickJS file snapshot: {:.3} ms ({})",
+        save_elapsed.as_secs_f64() * 1_000.0,
+        digest
+    );
+    println!("memory baseline before batch: {memory_baseline} KiB");
+    println!("memory with {sandbox_count} live sandboxes: {memory_loaded} KiB");
+    println!("incremental batch RSS: {delta_kib} KiB");
+    println!(
+        "incremental RSS per live JS sandbox: {:.2} MiB",
+        delta_kib as f64 / sandbox_count as f64 / 1024.0
+    );
+
+    Ok(())
+}

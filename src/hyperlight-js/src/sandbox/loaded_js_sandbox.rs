@@ -14,12 +14,14 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 use std::fmt::Debug;
+use std::path::Path;
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use hyperlight_host::hypervisor::InterruptHandle;
-use hyperlight_host::sandbox::snapshot::Snapshot;
+use hyperlight_host::sandbox::snapshot::{OciTag, Snapshot};
 use hyperlight_host::HyperlightError::{self, JsonConversionFailure};
-use hyperlight_host::{MultiUseSandbox, Result, SandboxStatus};
+use hyperlight_host::{new_error, MultiUseSandbox, Result, SandboxStatus};
 use tokio::task::JoinHandle;
 use tracing::{instrument, Level};
 
@@ -72,6 +74,67 @@ impl LoadedJSSandbox {
             #[cfg(feature = "guest-call-stats")]
             last_call_stats: None,
         })
+    }
+
+    /// Saves the initialized JavaScript runtime, loaded handlers, and guest state
+    /// to a Hyperlight OCI snapshot layout on disk.
+    pub fn save_file_snapshot(
+        &mut self,
+        path: impl AsRef<Path>,
+        tag: impl Into<String>,
+    ) -> Result<String> {
+        let snapshot = self.snapshot()?;
+        let tag = OciTag::new(tag.into())?;
+        let digest = snapshot.save(path, &tag)?;
+        Ok(digest.as_str().to_string())
+    }
+
+    /// Restores a loaded JavaScript sandbox from a Hyperlight OCI snapshot layout.
+    ///
+    /// This convenience API restores snapshots that do not use custom host
+    /// modules. Snapshots using custom host modules require the original host
+    /// function implementations and cannot be reconstructed by this method.
+    pub fn from_file_snapshot(
+        path: impl AsRef<Path>,
+        tag: impl Into<String>,
+    ) -> Result<LoadedJSSandbox> {
+        let tag = OciTag::new(tag.into())?;
+        let snapshot = Arc::new(Snapshot::load(path, tag)?);
+        Self::from_snapshot(snapshot)
+    }
+
+    /// Restores a loaded JavaScript sandbox from an in-memory Hyperlight snapshot.
+    ///
+    /// This convenience API restores snapshots that do not use custom host
+    /// modules. Snapshots using custom host modules require the original host
+    /// function implementations and cannot be reconstructed by this method.
+    pub fn from_snapshot(snapshot: Arc<Snapshot>) -> Result<LoadedJSSandbox> {
+        fn current_time_micros() -> Result<u64> {
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map(|duration| duration.as_micros() as u64)
+                .map_err(|error| new_error!("Unable to get duration since epoch: {}", error))
+        }
+
+        let inner = hyperlight_host::SandboxBuilder::from_snapshot(snapshot.clone())
+            .host_function("CurrentTimeMicros", current_time_micros)
+            .host_function(
+                "CallHostJsFunction",
+                |module_name: String,
+                 function_name: String,
+                 _args_json: String,
+                 _binaries: Vec<u8>|
+                 -> Result<Vec<u8>> {
+                    Err(new_error!(
+                        "Host module '{}.{}' is unavailable after file snapshot restore",
+                        module_name,
+                        function_name
+                    ))
+                },
+            )
+            .build()?;
+
+        LoadedJSSandbox::new(inner, snapshot)
     }
 
     /// Handles an event by calling the specified function with the event data.

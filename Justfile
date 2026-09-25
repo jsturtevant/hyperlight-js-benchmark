@@ -21,6 +21,9 @@ export CMAKE_GENERATOR := if os() == "windows" { "Ninja" } else { "" }
 ensure-tools:
     cargo install cargo-hyperlight --locked
 
+benchmark:
+    ./run-benchmark.sh
+
 # Check if npm is installed, install automatically if missing (Linux)
 [private]
 [unix]
