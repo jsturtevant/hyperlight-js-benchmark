@@ -1,0 +1,3 @@
+[submodule "upstream/hyperlight-js"]
+	path = upstream/hyperlight-js
+	url = https://github.com/hyperlight-dev/hyperlight-js.git
